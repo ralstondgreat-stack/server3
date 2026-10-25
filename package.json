@@ -1,8 +1,9 @@
 {
-  "name": "guardian-pairing-api",
-  "version": "1.2.0",
+  "name": "guardian-render-relay",
+  "version": "1.3.0",
   "private": true,
+  "description": "Guardian Parent/Kid bidirectional message relay prototype",
   "main": "server.js",
-  "scripts": {"start": "node server.js"},
-  "engines": {"node": ">=18"}
+  "scripts": { "start": "node server.js" },
+  "engines": { "node": ">=18" }
 }
