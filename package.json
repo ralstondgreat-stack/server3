@@ -1,9 +1,10 @@
 {
-  "name": "guardian-render-relay",
-  "version": "1.3.0",
+  "name": "guardian-family-safety-api",
+  "version": "1.0.0",
   "private": true,
-  "description": "Guardian Parent/Kid bidirectional message relay prototype",
-  "main": "server.js",
-  "scripts": { "start": "node server.js" },
-  "engines": { "node": ">=18" }
+  "description": "Guardian/KID API starter for authorized family safety enrollment, SOS, location and PIN-change commands",
+  "main": "src/server.js",
+  "scripts": {"start": "node src/server.js", "dev": "node --watch src/server.js"},
+  "engines": {"node": ">=20"},
+  "dependencies": {"express": "^4.21.2", "helmet": "^8.0.0", "pg": "^8.13.1", "express-rate-limit": "^7.5.0"}
 }

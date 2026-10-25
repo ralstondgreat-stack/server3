@@ -1,192 +1,157 @@
 'use strict';
-const http = require('http');
+const express = require('express');
+const helmet = require('helmet');
+const rateLimit = require('express-rate-limit');
+const { Pool } = require('pg');
 const crypto = require('crypto');
-const { URL } = require('url');
+const fs = require('fs');
+const path = require('path');
 
-const PORT = process.env.PORT || 10000;
-const devices = new Map();       // deviceId -> device state
-const parentTokens = new Map();  // token -> deviceId
-const childTokens = new Map();   // token -> deviceId
-const pairCodes = new Map();     // code -> {deviceId, expires}
-const MAX_BODY = 64 * 1024;
+const app = express();
+app.disable('x-powered-by');
+app.use(helmet());
+app.use(express.json({ limit: '24kb' }));
+app.use(rateLimit({ windowMs: 60_000, limit: 120, standardHeaders: true, legacyHeaders: false }));
+const pool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: process.env.PGSSL === 'true' ? { rejectUnauthorized: false } : undefined });
+const PORT = Number(process.env.PORT || 3000);
+const uuid = () => crypto.randomUUID();
+const hash = (s) => crypto.createHash('sha256').update(String(s)).digest('hex');
+const token = () => crypto.randomBytes(32).toString('base64url');
+const code = () => String(crypto.randomInt(0, 1000000)).padStart(6, '0');
+const asyncRoute = fn => (req,res,next) => Promise.resolve(fn(req,res,next)).catch(next);
 
-function token() { return crypto.randomBytes(32).toString('hex'); }
-function code() { return String(Math.floor(100000 + Math.random() * 900000)); }
-function now() { return Date.now(); }
-function json(res, status, body) {
-  const data = JSON.stringify(body);
-  res.writeHead(status, {
-    'Content-Type': 'application/json; charset=utf-8',
-    'Content-Length': Buffer.byteLength(data),
-    'Cache-Control': 'no-store',
-    'Access-Control-Allow-Origin': '*',
-    'Access-Control-Allow-Headers': 'Content-Type, Authorization',
-    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS'
-  });
-  res.end(data);
+async function ensureSchema() {
+  const sql = fs.readFileSync(path.join(__dirname, '..', 'sql', 'schema.sql'), 'utf8');
+  await pool.query(sql);
 }
-function readBody(req) {
-  return new Promise((resolve, reject) => {
-    let data = '';
-    req.on('data', chunk => {
-      data += chunk;
-      if (Buffer.byteLength(data) > MAX_BODY) {
-        reject(new Error('Body too large'));
-        req.destroy();
-      }
-    });
-    req.on('end', () => {
-      try { resolve(data ? JSON.parse(data) : {}); }
-      catch (_) { reject(new Error('Invalid JSON')); }
-    });
-    req.on('error', reject);
-  });
-}
-function auth(req, map) {
-  const h = String(req.headers.authorization || '');
-  if (!h.startsWith('Bearer ')) return null;
-  const id = map.get(h.slice(7));
-  return id ? devices.get(id) || null : null;
-}
-function clean() {
-  const t = now();
-  for (const [c, p] of pairCodes) if (p.expires < t) pairCodes.delete(c);
-  for (const [id, d] of devices) {
-    d.messages = d.messages.filter(m => t - m.createdAt < 7 * 24 * 60 * 60 * 1000);
-    d.events = d.events.filter(e => t - e.createdAt < 30 * 24 * 60 * 60 * 1000);
-  }
-}
-function enqueueMessage(d, from, message) {
-  const item = { id: crypto.randomUUID(), from, message, createdAt: now(), delivered: false };
-  d.messages.push(item);
-  return item;
-}
-function enqueueEvent(d, type, message) {
-  const item = { id: crypto.randomUUID(), type, message, createdAt: now(), acknowledged: false };
-  d.events.push(item);
-  return item;
-}
-
-const server = http.createServer(async (req, res) => {
-  if (req.method === 'OPTIONS') return json(res, 204, {});
+async function auth(req, res, next) {
   try {
-    clean();
-    const u = new URL(req.url, 'http://localhost');
-    if (req.method === 'GET' && u.pathname === '/health')
-      return json(res, 200, { ok: true, service: 'Guardian Render relay', version: '1.3.0' });
+    const raw = (req.headers.authorization || '').replace(/^Bearer\s+/i, '').trim();
+    if (!raw) return res.status(401).json({ error: 'Bearer token required' });
+    const result = await pool.query('SELECT id, family_id, role, label FROM devices WHERE token_hash=$1', [hash(raw)]);
+    if (!result.rowCount) return res.status(401).json({ error: 'Invalid device token' });
+    req.device = result.rows[0];
+    await pool.query('UPDATE devices SET last_seen_at=NOW() WHERE id=$1', [req.device.id]);
+    next();
+  } catch (e) { next(e); }
+}
+function role(wanted) { return (req,res,next) => req.device.role === wanted ? next() : res.status(403).json({error:`${wanted} device required`}); }
+async function event(familyId, deviceId, type, payload={}) {
+  await pool.query('INSERT INTO events(family_id,device_id,type,payload) VALUES($1,$2,$3,$4)', [familyId,deviceId,type,payload]);
+}
 
-    if (req.method === 'POST' && u.pathname === '/v1/pair/start') {
-      const b = await readBody(req);
-      const label = String(b.parentLabel || 'Guardian Parent').slice(0, 60);
-      const deviceId = crypto.randomUUID();
-      const parentToken = token();
-      const d = {
-        id: deviceId, parentLabel: label, childLabel: 'Unpaired Kid',
-        parentOnline: true, childOnline: false, parentSeen: now(), childSeen: 0,
-        messages: [], events: []
-      };
-      devices.set(deviceId, d);
-      parentTokens.set(parentToken, deviceId);
-      let pairingCode = code();
-      while (pairCodes.has(pairingCode)) pairingCode = code();
-      pairCodes.set(pairingCode, { deviceId, expires: now() + 10 * 60 * 1000 });
-      return json(res, 200, { deviceId, parentToken, pairingCode, expiresInSeconds: 600 });
-    }
+app.get('/', (_req,res) => res.json({ name:'Guardian API', status:'ok', api:'/api/health' }));
+app.get('/api/health', asyncRoute(async (_req,res) => {
+  await pool.query('SELECT 1'); res.json({ ok:true, service:'guardian-api', time:new Date().toISOString() });
+}));
 
-    if (req.method === 'POST' && u.pathname === '/v1/pair/claim') {
-      const b = await readBody(req);
-      const pairingCode = String(b.code || '').trim();
-      const p = pairCodes.get(pairingCode);
-      if (!p || p.expires < now()) return json(res, 401, { error: 'Pairing code invalid or expired' });
-      const d = devices.get(p.deviceId);
-      if (!d) return json(res, 404, { error: 'Parent session not found' });
-      pairCodes.delete(pairingCode);
-      const childToken = token();
-      childTokens.set(childToken, d.id);
-      d.childLabel = String(b.childLabel || 'Guardian Kid').slice(0, 60);
-      d.childSeen = now();
-      d.childOnline = true;
-      enqueueEvent(d, 'paired', 'Kid device approved pairing: ' + d.childLabel);
-      return json(res, 200, { deviceId: d.id, childToken, parentLabel: d.parentLabel });
-    }
+// Create a family and a parent device. Keep the returned token private.
+app.post('/api/setup/parent', rateLimit({windowMs:60*60*1000, limit:10}), asyncRoute(async (req,res) => {
+  const label = String(req.body?.label || 'Guardian phone').slice(0,80);
+  const familyId = uuid(), deviceId = uuid(), rawToken = token();
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query('INSERT INTO families(id) VALUES($1)',[familyId]);
+    await client.query('INSERT INTO devices(id,family_id,role,label,token_hash) VALUES($1,$2,$3,$4,$5)',[deviceId,familyId,'parent',label,hash(rawToken)]);
+    await client.query('COMMIT');
+  } catch(e) { await client.query('ROLLBACK'); throw e; } finally { client.release(); }
+  res.status(201).json({ familyId, deviceId, role:'parent', token:rawToken, warning:'Store this token securely. It cannot be retrieved later.' });
+}));
 
-    if (req.method === 'POST' && u.pathname === '/v1/parent/message') {
-      const d = auth(req, parentTokens);
-      if (!d) return json(res, 401, { error: 'Invalid parent token' });
-      const b = await readBody(req);
-      const message = String(b.message || '').trim();
-      if (!message || message.length > 1000) return json(res, 400, { error: 'Message must be 1-1000 characters' });
-      d.parentSeen = now();
-      const item = enqueueMessage(d, 'parent', message);
-      return json(res, 200, { ok: true, id: item.id, queued: true });
-    }
+app.post('/api/enrollment/code', auth, role('parent'), asyncRoute(async (req,res) => {
+  const plain = code(), codeHash = hash(plain);
+  await pool.query('INSERT INTO enroll_codes(code_hash,family_id,parent_device_id,expires_at) VALUES($1,$2,$3,NOW()+INTERVAL \'10 minutes\')',[codeHash,req.device.family_id,req.device.id]);
+  res.status(201).json({ code:plain, expiresInSeconds:600, instructions:'Enter this code in the KID app with the parent present.' });
+}));
 
-    if (req.method === 'POST' && u.pathname === '/v1/kid/message') {
-      const d = auth(req, childTokens);
-      if (!d) return json(res, 401, { error: 'Invalid kid token' });
-      const b = await readBody(req);
-      const message = String(b.message || '').trim();
-      if (!message || message.length > 1000) return json(res, 400, { error: 'Message must be 1-1000 characters' });
-      d.childSeen = now();
-      const item = enqueueMessage(d, 'kid', message);
-      return json(res, 200, { ok: true, id: item.id, queued: true });
-    }
+app.post('/api/enrollment/complete', rateLimit({windowMs:60_000,limit:10}), asyncRoute(async (req,res) => {
+  const provided = String(req.body?.code || '').trim();
+  const label = String(req.body?.label || 'KID device').slice(0,80);
+  if (!/^\d{6}$/.test(provided)) return res.status(400).json({error:'A six-digit enrollment code is required'});
+  const client = await pool.connect();
+  const deviceId = uuid(), rawToken = token();
+  try {
+    await client.query('BEGIN');
+    const c = await client.query('SELECT * FROM enroll_codes WHERE code_hash=$1 AND used_at IS NULL AND expires_at>NOW() FOR UPDATE',[hash(provided)]);
+    if (!c.rowCount) { await client.query('ROLLBACK'); return res.status(400).json({error:'Invalid or expired enrollment code'}); }
+    const familyId = c.rows[0].family_id;
+    await client.query('INSERT INTO devices(id,family_id,role,label,token_hash) VALUES($1,$2,$3,$4,$5)',[deviceId,familyId,'kid',label,hash(rawToken)]);
+    await client.query('UPDATE enroll_codes SET used_at=NOW() WHERE code_hash=$1',[hash(provided)]);
+    await client.query('COMMIT');
+    await event(familyId,deviceId,'device_enrolled',{label});
+    res.status(201).json({ familyId, deviceId, role:'kid', token:rawToken, warning:'Store this token securely. It cannot be retrieved later.' });
+  } catch(e) { await client.query('ROLLBACK'); throw e; } finally { client.release(); }
+}));
 
-    if (req.method === 'POST' && u.pathname === '/v1/kid/sos') {
-      const d = auth(req, childTokens);
-      if (!d) return json(res, 401, { error: 'Invalid kid token' });
-      const b = await readBody(req);
-      const message = String(b.message || 'SOS: Please contact me.').slice(0, 500);
-      d.childSeen = now();
-      const item = enqueueEvent(d, 'sos', message);
-      return json(res, 200, { ok: true, id: item.id, queued: true });
-    }
+app.get('/api/device/status', auth, asyncRoute(async (req,res) => {
+  const q = await pool.query('SELECT id,role,label,last_seen_at,created_at FROM devices WHERE family_id=$1 ORDER BY created_at',[req.device.family_id]);
+  res.json({ devices:q.rows.map(d=>({...d, online: d.last_seen_at && (Date.now()-new Date(d.last_seen_at).getTime()<120000)})) });
+}));
 
-    if (req.method === 'GET' && u.pathname === '/v1/parent/inbox') {
-      const d = auth(req, parentTokens);
-      if (!d) return json(res, 401, { error: 'Invalid parent token' });
-      d.parentSeen = now();
-      const messages = d.messages.filter(m => m.from === 'kid' && !m.delivered);
-      const events = d.events.filter(e => !e.acknowledged);
-      messages.forEach(m => m.delivered = true);
-      events.forEach(e => e.acknowledged = true);
-      return json(res, 200, {
-        deviceId: d.id, childLabel: d.childLabel,
-        childOnline: now() - d.childSeen < 45000,
-        childLastSeen: d.childSeen, messages, events
-      });
-    }
-
-    if (req.method === 'GET' && u.pathname === '/v1/kid/inbox') {
-      const d = auth(req, childTokens);
-      if (!d) return json(res, 401, { error: 'Invalid kid token' });
-      d.childSeen = now();
-      const messages = d.messages.filter(m => m.from === 'parent' && !m.delivered);
-      messages.forEach(m => m.delivered = true);
-      return json(res, 200, {
-        parentLabel: d.parentLabel,
-        parentOnline: now() - d.parentSeen < 45000,
-        parentLastSeen: d.parentSeen, messages
-      });
-    }
-
-    if (req.method === 'POST' && u.pathname === '/v1/parent/heartbeat') {
-      const d = auth(req, parentTokens);
-      if (!d) return json(res, 401, { error: 'Invalid parent token' });
-      d.parentSeen = now();
-      return json(res, 200, { ok: true, childOnline: now() - d.childSeen < 45000 });
-    }
-
-    if (req.method === 'POST' && u.pathname === '/v1/kid/heartbeat') {
-      const d = auth(req, childTokens);
-      if (!d) return json(res, 401, { error: 'Invalid kid token' });
-      d.childSeen = now();
-      return json(res, 200, { ok: true, parentOnline: now() - d.parentSeen < 45000 });
-    }
-
-    return json(res, 404, { error: 'Not found' });
-  } catch (e) {
-    return json(res, 400, { error: e.message || 'Bad request' });
+app.post('/api/sos', auth, role('kid'), asyncRoute(async (req,res) => {
+  const message = String(req.body?.message || 'SOS alert').slice(0,500);
+  const location = req.body?.location;
+  let safeLocation = null;
+  if (location && Number.isFinite(Number(location.latitude)) && Number.isFinite(Number(location.longitude)) && Math.abs(Number(location.latitude))<=90 && Math.abs(Number(location.longitude))<=180) {
+    safeLocation = {latitude:Number(location.latitude),longitude:Number(location.longitude),accuracyM:Number(location.accuracyM)||null};
   }
+  await event(req.device.family_id,req.device.id,'sos',{message,location:safeLocation});
+  res.status(202).json({ accepted:true, message:'SOS stored for Guardian to retrieve.' });
+}));
+
+app.post('/api/location', auth, role('kid'), asyncRoute(async (req,res) => {
+  const lat=Number(req.body?.latitude), lon=Number(req.body?.longitude), accuracy=req.body?.accuracyM == null ? null : Number(req.body.accuracyM);
+  if (!Number.isFinite(lat)||!Number.isFinite(lon)||Math.abs(lat)>90||Math.abs(lon)>180) return res.status(400).json({error:'Valid latitude and longitude are required'});
+  const capturedAt = req.body?.capturedAt ? new Date(req.body.capturedAt) : new Date();
+  if (Number.isNaN(capturedAt.getTime()) || capturedAt.getTime()>Date.now()+60000) return res.status(400).json({error:'Invalid capturedAt'});
+  await pool.query(`INSERT INTO locations(device_id,family_id,latitude,longitude,accuracy_m,captured_at,updated_at) VALUES($1,$2,$3,$4,$5,$6,NOW()) ON CONFLICT(device_id) DO UPDATE SET latitude=EXCLUDED.latitude,longitude=EXCLUDED.longitude,accuracy_m=EXCLUDED.accuracy_m,captured_at=EXCLUDED.captured_at,updated_at=NOW()`,[req.device.id,req.device.family_id,lat,lon,Number.isFinite(accuracy)?accuracy:null,capturedAt]);
+  res.status(202).json({accepted:true});
+}));
+app.get('/api/location', auth, role('parent'), asyncRoute(async (req,res) => {
+  const q=await pool.query(`SELECT l.device_id,l.latitude,l.longitude,l.accuracy_m,l.captured_at,l.updated_at,d.label FROM locations l JOIN devices d ON d.id=l.device_id WHERE l.family_id=$1 ORDER BY l.updated_at DESC`,[req.device.family_id]);
+  res.json({locations:q.rows});
+}));
+
+app.get('/api/events', auth, role('parent'), asyncRoute(async (req,res) => {
+  const limit=Math.max(1,Math.min(100,Number.parseInt(req.query.limit||'50',10)||50));
+  const q=await pool.query('SELECT e.id,e.type,e.payload,e.created_at,d.label AS device_label FROM events e LEFT JOIN devices d ON d.id=e.device_id WHERE e.family_id=$1 ORDER BY e.created_at DESC LIMIT $2',[req.device.family_id,limit]);
+  res.json({events:q.rows});
+}));
+
+// PIN updates carry only a salted scrypt verifier, never the raw PIN. Since a 4-digit PIN has a small search space,
+// use it only as an app convenience lock and retain Android/device-level protections.
+app.post('/api/pin/change', auth, role('parent'), asyncRoute(async (req,res) => {
+  const targetId=String(req.body?.targetDeviceId||'');
+  const salt=String(req.body?.salt||'');
+  const verifier=String(req.body?.verifier||'');
+  if (!targetId || !/^[a-f0-9]{32,128}$/i.test(salt) || !/^[a-f0-9]{64,256}$/i.test(verifier)) return res.status(400).json({error:'targetDeviceId, salt and verifier are required'});
+  const target=await pool.query("SELECT id FROM devices WHERE id=$1 AND family_id=$2 AND role='kid'",[targetId,req.device.family_id]);
+  if (!target.rowCount) return res.status(404).json({error:'KID device not found in this family'});
+  const id=uuid();
+  await pool.query("INSERT INTO commands(id,family_id,target_device_id,created_by_device_id,type,payload,expires_at) VALUES($1,$2,$3,$4,'PIN_HASH_UPDATE',$5,NOW()+INTERVAL '24 hours')",[id,req.device.family_id,targetId,req.device.id,{salt,verifier}]);
+  await event(req.device.family_id,req.device.id,'pin_change_requested',{targetDeviceId:targetId,commandId:id});
+  res.status(202).json({accepted:true,commandId:id,status:'pending'});
+}));
+app.get('/api/commands/pending', auth, role('kid'), asyncRoute(async (req,res) => {
+  const q=await pool.query("SELECT id,type,payload,created_at,expires_at FROM commands WHERE target_device_id=$1 AND status='pending' AND expires_at>NOW() ORDER BY created_at LIMIT 20",[req.device.id]);
+  res.json({commands:q.rows});
+}));
+app.post('/api/commands/:id/ack', auth, role('kid'), asyncRoute(async (req,res) => {
+  const status=String(req.body?.status||'');
+  if (!['applied','rejected'].includes(status)) return res.status(400).json({error:'status must be applied or rejected'});
+  const q=await pool.query("UPDATE commands SET status=$1,acknowledged_at=NOW() WHERE id=$2 AND target_device_id=$3 AND status='pending' RETURNING id,type",[status,req.params.id,req.device.id]);
+  if (!q.rowCount) return res.status(404).json({error:'Pending command not found'});
+  await event(req.device.family_id,req.device.id,'command_acknowledged',{commandId:req.params.id,status});
+  res.json({ok:true,status});
+}));
+
+app.use((err,_req,res,_next) => {
+  console.error(err);
+  res.status(500).json({error:'Internal server error'});
 });
-server.listen(PORT, '0.0.0.0', () => console.log('Guardian relay listening on ' + PORT));
+(async()=>{
+  if (!process.env.DATABASE_URL) { console.error('DATABASE_URL is required.'); process.exit(1); }
+  await ensureSchema();
+  app.listen(PORT,'0.0.0.0',()=>console.log(`Guardian API listening on ${PORT}`));
+})().catch(e=>{console.error('Startup failed',e);process.exit(1)});
