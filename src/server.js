@@ -85,8 +85,21 @@ app.post('/api/enrollment/complete', rateLimit({windowMs:60_000,limit:10}), asyn
 }));
 
 app.get('/api/device/status', auth, asyncRoute(async (req,res) => {
-  const q = await pool.query('SELECT id,role,label,last_seen_at,created_at FROM devices WHERE family_id=$1 ORDER BY created_at',[req.device.family_id]);
+  const q = await pool.query('SELECT id,role,label,last_seen_at,created_at,battery_percent,device_model,android_version,app_version,app_state,status_updated_at FROM devices WHERE family_id=$1 ORDER BY created_at',[req.device.family_id]);
   res.json({ devices:q.rows.map(d=>({...d, online: d.last_seen_at && (Date.now()-new Date(d.last_seen_at).getTime()<120000)})) });
+}));
+
+// KID heartbeat: reports only basic device/app status, not location or personal content.
+app.post('/api/device/heartbeat', auth, role('kid'), asyncRoute(async (req,res) => {
+  const rawBattery=req.body?.batteryPercent;
+  const battery=rawBattery===null || rawBattery===undefined || rawBattery==='' ? null : Number(rawBattery);
+  if (battery!==null && (!Number.isInteger(battery) || battery<0 || battery>100)) return res.status(400).json({error:'batteryPercent must be an integer from 0 to 100, or null'});
+  const deviceModel=String(req.body?.deviceModel||'').slice(0,160);
+  const androidVersion=String(req.body?.androidVersion||'').slice(0,40);
+  const appVersion=String(req.body?.appVersion||'').slice(0,40);
+  const appState=['foreground','background','unknown'].includes(String(req.body?.appState||'')) ? String(req.body.appState) : 'unknown';
+  await pool.query('UPDATE devices SET battery_percent=$2,device_model=$3,android_version=$4,app_version=$5,app_state=$6,status_updated_at=NOW(),last_seen_at=NOW() WHERE id=$1',[req.device.id,battery,deviceModel,androidVersion,appVersion,appState]);
+  res.json({accepted:true,serverTime:new Date().toISOString()});
 }));
 
 app.post('/api/sos', auth, role('kid'), asyncRoute(async (req,res) => {
