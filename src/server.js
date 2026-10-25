@@ -90,6 +90,7 @@ app.get('/api/device/status', auth, asyncRoute(async (req,res) => {
 }));
 
 // KID heartbeat: reports only basic device/app status, not location or personal content.
+
 app.post('/api/device/heartbeat', auth, role('kid'), asyncRoute(async (req,res) => {
   const rawBattery=req.body?.batteryPercent;
   const battery=rawBattery===null || rawBattery===undefined || rawBattery==='' ? null : Number(rawBattery);
@@ -102,6 +103,7 @@ app.post('/api/device/heartbeat', auth, role('kid'), asyncRoute(async (req,res) 
   res.json({accepted:true,serverTime:new Date().toISOString()});
 }));
 
+
 app.post('/api/sos', auth, role('kid'), asyncRoute(async (req,res) => {
   const message = String(req.body?.message || 'SOS alert').slice(0,500);
   const location = req.body?.location;
@@ -109,8 +111,11 @@ app.post('/api/sos', auth, role('kid'), asyncRoute(async (req,res) => {
   if (location && Number.isFinite(Number(location.latitude)) && Number.isFinite(Number(location.longitude)) && Math.abs(Number(location.latitude))<=90 && Math.abs(Number(location.longitude))<=180) {
     safeLocation = {latitude:Number(location.latitude),longitude:Number(location.longitude),accuracyM:Number(location.accuracyM)||null};
   }
-  await event(req.device.family_id,req.device.id,'sos',{message,location:safeLocation});
-  res.status(202).json({ accepted:true, message:'SOS stored for Guardian to retrieve.' });
+  const inserted = await pool.query(
+    'INSERT INTO events(family_id,device_id,type,payload) VALUES($1,$2,$3,$4) RETURNING id',
+    [req.device.family_id,req.device.id,'sos',{message,location:safeLocation}]
+  );
+  res.status(202).json({ accepted:true, eventId:String(inserted.rows[0].id), message:'SOS stored; Parent app retrieves it through authenticated polling.' });
 }));
 
 app.post('/api/location', auth, role('kid'), asyncRoute(async (req,res) => {
