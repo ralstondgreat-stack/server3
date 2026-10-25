@@ -9,6 +9,12 @@ CREATE TABLE IF NOT EXISTS devices (
   label TEXT NOT NULL DEFAULT '',
   token_hash TEXT NOT NULL UNIQUE,
   last_seen_at TIMESTAMPTZ,
+  battery_percent INTEGER CHECK (battery_percent BETWEEN 0 AND 100),
+  device_model TEXT NOT NULL DEFAULT '',
+  android_version TEXT NOT NULL DEFAULT '',
+  app_version TEXT NOT NULL DEFAULT '',
+  app_state TEXT NOT NULL DEFAULT 'unknown',
+  status_updated_at TIMESTAMPTZ,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 CREATE TABLE IF NOT EXISTS enroll_codes (
@@ -50,3 +56,11 @@ CREATE TABLE IF NOT EXISTS commands (
 );
 CREATE INDEX IF NOT EXISTS events_family_created_idx ON events(family_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS commands_target_status_idx ON commands(target_device_id, status, created_at);
+
+-- Safe additive migration for databases created by earlier Guardian versions.
+ALTER TABLE devices ADD COLUMN IF NOT EXISTS battery_percent INTEGER CHECK (battery_percent BETWEEN 0 AND 100);
+ALTER TABLE devices ADD COLUMN IF NOT EXISTS device_model TEXT NOT NULL DEFAULT '';
+ALTER TABLE devices ADD COLUMN IF NOT EXISTS android_version TEXT NOT NULL DEFAULT '';
+ALTER TABLE devices ADD COLUMN IF NOT EXISTS app_version TEXT NOT NULL DEFAULT '';
+ALTER TABLE devices ADD COLUMN IF NOT EXISTS app_state TEXT NOT NULL DEFAULT 'unknown';
+ALTER TABLE devices ADD COLUMN IF NOT EXISTS status_updated_at TIMESTAMPTZ;
