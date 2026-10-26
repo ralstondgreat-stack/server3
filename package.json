@@ -1,10 +1,16 @@
 {
-  "name": "guardian-family-safety-api",
-  "version": "1.0.0",
+  "name": "kids-protection-api",
+  "version": "1.7.0",
   "private": true,
-  "description": "Guardian/KID API starter for authorized family safety enrollment, SOS, location and PIN-change commands",
+  "description": "Kids Protection Parent/Child pairing backend",
   "main": "src/server.js",
-  "scripts": {"start": "node src/server.js", "dev": "node --watch src/server.js"},
-  "engines": {"node": ">=20"},
-  "dependencies": {"express": "^4.21.2", "helmet": "^8.0.0", "pg": "^8.13.1", "express-rate-limit": "^7.5.0"}
+  "scripts": { "start": "node src/server.js", "dev": "node --watch src/server.js" },
+  "engines": { "node": ">=20" },
+  "dependencies": {
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "helmet": "^8.0.0",
+    "express-rate-limit": "^7.5.0",
+    "pg": "^8.13.1"
+  }
 }
