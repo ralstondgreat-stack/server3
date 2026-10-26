@@ -38,7 +38,7 @@ const makeCode = () => {
 app.get('/health', async (_req, res) => {
   try {
     await pool.query('SELECT 1');
-    res.json({ ok: true, service: 'kids-protection-api', version: '1.7.0', database: 'connected' });
+    res.json({ ok: true, service: 'kids-protection-api', version: '1.8.0', database: 'connected' });
   } catch (_e) {
     res.status(503).json({ ok: false, error: 'database_unavailable' });
   }
@@ -89,6 +89,116 @@ function requireRole(role) {
     ? next()
     : res.status(403).json({ error: 'wrong_device_role' });
 }
+
+// Mobile pairing flow: CHILD creates the code, PARENT enters and claims it.
+// These endpoints intentionally match the current Android source paths.
+app.post('/v1/pair/start', async (req, res) => {
+  const deviceName = String((req.body && req.body.deviceName) || 'Child device').trim().slice(0, 80) || 'Child device';
+  const suppliedId = String((req.body && req.body.deviceId) || '');
+  const childId = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(suppliedId)
+    ? suppliedId : crypto.randomUUID();
+  const childToken = crypto.randomBytes(32).toString('base64url');
+
+  try {
+    const child = await pool.query(
+      `INSERT INTO devices(id, role, device_name, token_hash)
+       VALUES($1, 'child', $2, $3)
+       ON CONFLICT (id) DO UPDATE
+         SET device_name=EXCLUDED.device_name, token_hash=EXCLUDED.token_hash, revoked_at=NULL
+         WHERE devices.role='child'
+       RETURNING id, device_name`,
+      [childId, deviceName, sha256(childToken)]
+    );
+    if (!child.rowCount) return res.status(409).json({ error: 'device_id_conflict' });
+
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const code = makeCode();
+      try {
+        const created = await pool.query(
+          `INSERT INTO pairing_codes(parent_device_id, child_device_id, code_hash, expires_at)
+           VALUES(NULL, $1, $2, NOW() + INTERVAL '10 minutes')
+           RETURNING id, expires_at`,
+          [child.rows[0].id, sha256(code)]
+        );
+        return res.status(201).json({
+          deviceId: child.rows[0].id,
+          deviceName: child.rows[0].device_name,
+          pairingCode: code,
+          deviceToken: childToken,
+          expiresAt: created.rows[0].expires_at,
+          expiresInSeconds: 600
+        });
+      } catch (e) {
+        if (e.code !== '23505') throw e;
+      }
+    }
+    return res.status(503).json({ error: 'could_not_generate_code_retry' });
+  } catch (e) {
+    console.error('child pairing start failed', e.message);
+    return res.status(500).json({ error: 'internal_error' });
+  }
+});
+
+app.post('/v1/pair/claim', async (req, res) => {
+  const code = String((req.body && req.body.code) || '').trim().toUpperCase();
+  if (!/^[A-HJ-NP-Z2-9]{8}$/.test(code)) return res.status(400).json({ error: 'invalid_code_format' });
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const found = await client.query(
+      `SELECT pc.id, pc.child_device_id, d.device_name
+       FROM pairing_codes pc
+       JOIN devices d ON d.id=pc.child_device_id
+       WHERE pc.code_hash=$1 AND pc.parent_device_id IS NULL
+         AND pc.child_device_id IS NOT NULL AND pc.used_at IS NULL
+         AND pc.expires_at > NOW() AND d.role='child' AND d.revoked_at IS NULL
+       FOR UPDATE OF pc`,
+      [sha256(code)]
+    );
+    if (!found.rowCount) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'invalid_expired_or_used_code' });
+    }
+
+    const child = found.rows[0];
+    const parentToken = crypto.randomBytes(32).toString('base64url');
+    const parentName = String((req.body && req.body.deviceName) || 'Parent device').trim().slice(0, 80) || 'Parent device';
+    const parent = await client.query(
+      `INSERT INTO devices(role, device_name, token_hash)
+       VALUES('parent', $1, $2) RETURNING id`,
+      [parentName, sha256(parentToken)]
+    );
+    const link = await client.query(
+      `INSERT INTO parent_child_links(parent_device_id, child_device_id)
+       VALUES($1, $2)
+       ON CONFLICT(parent_device_id, child_device_id)
+       DO UPDATE SET revoked_at=NULL, paired_at=NOW()
+       RETURNING id, paired_at`,
+      [parent.rows[0].id, child.child_device_id]
+    );
+    await client.query(
+      'UPDATE pairing_codes SET parent_device_id=$2, used_at=NOW() WHERE id=$1',
+      [child.id, parent.rows[0].id]
+    );
+    await client.query('COMMIT');
+    return res.json({
+      paired: true,
+      pairingId: link.rows[0].id,
+      pairedAt: link.rows[0].paired_at,
+      deviceId: child.child_device_id,
+      deviceName: child.device_name,
+      parentToken,
+      tokenType: 'Bearer'
+    });
+  } catch (e) {
+    await client.query('ROLLBACK').catch(() => {});
+    console.error('parent pairing claim failed', e.message);
+    return res.status(500).json({ error: 'internal_error' });
+  } finally {
+    client.release();
+  }
+});
 
 app.post('/v1/pairing-codes', authenticate, requireRole('parent'), async (req, res) => {
   // Retry rare collisions without exposing stored code hashes.
@@ -194,8 +304,20 @@ app.use((err, _req, res, _next) => {
 });
 
 const port = Number(process.env.PORT || 3000);
-const server = app.listen(port, '0.0.0.0', () => console.log(`Kids Protection API listening on ${port}`));
+let server;
+async function startServer() {
+  // Existing V1.7 databases created parent_device_id as NOT NULL. The new child-first
+  // flow leaves it NULL until a parent claims the code, so apply this safe migration.
+  await pool.query('ALTER TABLE pairing_codes ALTER COLUMN parent_device_id DROP NOT NULL');
+  server = app.listen(port, '0.0.0.0', () => console.log(`Kids Protection API v1.8.0 listening on ${port}`));
+}
+startServer().catch(async e => {
+  console.error('Server startup/migration failed:', e.message);
+  await pool.end();
+  process.exit(1);
+});
 async function shutdown() {
+  if (!server) { await pool.end(); process.exit(0); return; }
   server.close(async () => { await pool.end(); process.exit(0); });
   setTimeout(() => process.exit(1), 10_000).unref();
 }
