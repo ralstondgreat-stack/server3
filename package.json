@@ -1,8 +1,8 @@
 {
   "name": "kids-protection-api",
-  "version": "1.8.0",
+  "version": "1.9.0",
   "private": true,
-  "description": "Kids Protection child-first Parent/Child pairing backend",
+  "description": "Kids Protection secure child-first Parent/Child pairing backend",
   "main": "src/server.js",
   "scripts": { "start": "node src/server.js", "dev": "node --watch src/server.js" },
   "engines": { "node": ">=20" },
