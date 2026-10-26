@@ -447,3 +447,12 @@ async function shutdown() {
 }
 process.on('SIGTERM', shutdown);
 process.on('SIGINT', shutdown);
+const result = await pool.query(
+  `INSERT INTO parent_child_links
+     (parent_device_id, child_device_id)
+   VALUES ($1, $2)
+   ON CONFLICT (parent_device_id, child_device_id)
+   DO UPDATE SET revoked_at = NULL
+   RETURNING id, paired_at`,
+  [pairing.parent_device_id, req.device.id]
+);
