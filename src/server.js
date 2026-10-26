@@ -244,7 +244,133 @@ app.post('/v1/pairing/redeem', authenticate, requireRole('child'), async (req, r
       return res.status(400).json({ error: 'cannot_pair_device_to_itself' });
     }
     const link = await client.query(
-      `INSERT INTO parent_child_links(parent_device_id, child_device_id)
+      `INSERT INTO parent_child_links (parent_device_id, child_device_id)
+       VALUES ($1, $2)
+       ON CONFLICT (parent_device_id, child_device_id)
+       DO UPDATE SET revoked_at = NULL
+       RETURNING id, paired_at`,
+      [pairing.parent_device_id, req.device.id]
+    );
+    await client.query(
+      'UPDATE pairing_codes SET used_at=NOW(), child_device_id=$2 WHERE id=$1',
+      [pairing.id, req.device.id]
+    );
+    await client.query('COMMIT');
+    res.json({ paired: true, pairingId: link.rows[0].id, pairedAt: link.rows[0].paired_at });
+  } catch (e) {
+    await client.query('ROLLBACK').catch(() => {});
+    console.error('pairing redemption failed', e.message);
+    res.status(500).json({ error: 'internal_error' });
+  } finally {
+    client.release();
+  }
+});
+
+app.get('/v1/children', authenticate, requireRole('parent'), async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT l.id AS pairing_id, l.paired_at, d.id AS child_device_id,
+              d.device_name, d.created_at AS registered_at
+       FROM parent_child_links l JOIN devices d ON d.id=l.child_device_id
+       WHERE l.parent_device_id=$1 AND l.revoked_at IS NULL
+       ORDER BY l.paired_at DESC`, [req.device.id]
+    );
+    res.json({ children: result.rows });
+  } catch (e) {
+    console.error('children query failed', e.message);
+    res.status(500).json({ error: 'internal_error' });
+  }
+});
+
+app.post('/v1/pairings/:pairingId/revoke', authenticate, requireRole('parent'), async (req, res) => {
+  const { pairingId } = req.params;
+  if (!/^[0-9a-f-]{36}$/i.test(pairingId)) return res.status(400).json({ error: 'invalid_pairing_id' });
+  try {
+    const result = await pool.query(
+      `UPDATE parent_child_links SET revoked_at=NOW()
+       WHERE id=$1 AND parent_device_id=$2 AND revoked_at IS NULL RETURNING id`,
+      [pairingId, req.device.id]
+    );
+    if (!result.rowCount) return res.status(404).json({ error: 'pairing_not_found' });
+    res.json({ revoked: true });
+  } catch (e) {
+    console.error('pairing revoke failed', e.message);
+    res.status(500).json({ error: 'internal_error' });
+  }
+});
+
+app.use((err, _req, res, _next) => {
+  if (err instanceof SyntaxError && 'body' in err) return res.status(400).json({ error: 'invalid_json' });
+  console.error('unhandled request error', err.message);
+  return res.status(500).json({ error: 'internal_error' });
+});
+
+const port = Number(process.env.PORT || 3000);
+let server;
+async function ensureDatabaseSchema() {
+  // Create tables before running ALTER TABLE. Some Render databases were deployed
+  // without running db/schema.sql, which caused startup to fail with
+  // relation \"pairing_codes\" does not exist.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS devices (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      role TEXT NOT NULL CHECK (role IN ('parent', 'child')),
+      device_name TEXT NOT NULL DEFAULT 'Android device',
+      token_hash CHAR(64) NOT NULL UNIQUE,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      revoked_at TIMESTAMPTZ
+    )
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS pairing_codes (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      parent_device_id UUID REFERENCES devices(id),
+      code_hash CHAR(64) NOT NULL UNIQUE,
+      expires_at TIMESTAMPTZ NOT NULL,
+      used_at TIMESTAMPTZ,
+      child_device_id UUID REFERENCES devices(id),
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+
+  // Add columns needed by child-first pairing when upgrading older installations.
+  await pool.query('ALTER TABLE pairing_codes ADD COLUMN IF NOT EXISTS child_device_id UUID REFERENCES devices(id)');
+  await pool.query('ALTER TABLE pairing_codes ADD COLUMN IF NOT EXISTS used_at TIMESTAMPTZ');
+  await pool.query('ALTER TABLE pairing_codes ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()');
+  await pool.query('ALTER TABLE pairing_codes ALTER COLUMN parent_device_id DROP NOT NULL');
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS parent_child_links (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      parent_device_id UUID NOT NULL REFERENCES devices(id),
+      child_device_id UUID NOT NULL REFERENCES devices(id),
+      paired_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      revoked_at TIMESTAMPTZ,
+      UNIQUE(parent_device_id, child_device_id)
+    )
+  `);
+  await pool.query('CREATE INDEX IF NOT EXISTS pairing_codes_parent_created_idx ON pairing_codes(parent_device_id, created_at DESC)');
+  await pool.query('CREATE INDEX IF NOT EXISTS pairing_codes_expiry_idx ON pairing_codes(expires_at)');
+}
+
+async function startServer() {
+  await ensureDatabaseSchema();
+  server = app.listen(port, '0.0.0.0', () => console.log(`Kids Protection API v1.8.1 listening on ${port}`));
+}
+startServer().catch(async e => {
+  console.error('Server startup/migration failed:', e.message);
+  await pool.end();
+  process.exit(1);
+});
+async function shutdown() {
+  if (!server) { await pool.end(); process.exit(0); return; }
+  server.close(async () => { await pool.end(); process.exit(0); });
+  setTimeout(() => process.exit(1), 10_000).unref();
+}
+process.on('SIGTERM', shutdown);
+process.on('SIGINT', shutdown);
+rent_device_id, child_device_id)
        VALUES($1,$2) ON CONFLICT(parent_device_id, child_device_id)
        DO UPDATE SET revoked_at=NULL RETURNING id, paired_at`,
       [pairing.parent_device_id, req.device.id]
