@@ -1,11 +1,16 @@
 {
   "name": "kids-protection-api",
-  "version": "1.9.0",
+  "version": "2.0.0",
   "private": true,
-  "description": "Kids Protection secure child-first Parent/Child pairing backend",
+  "description": "Kids Protection API with paired live location and screen-time reporting",
   "main": "src/server.js",
-  "scripts": { "start": "node src/server.js", "dev": "node --watch src/server.js" },
-  "engines": { "node": ">=20" },
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
   "dependencies": {
     "dotenv": "^16.4.7",
     "express": "^4.21.2",
