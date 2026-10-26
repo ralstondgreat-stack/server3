@@ -11,7 +11,7 @@ CREATE TABLE IF NOT EXISTS devices (
 
 CREATE TABLE IF NOT EXISTS pairing_codes (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  parent_device_id UUID NOT NULL REFERENCES devices(id),
+  parent_device_id UUID REFERENCES devices(id),
   code_hash CHAR(64) NOT NULL UNIQUE,
   expires_at TIMESTAMPTZ NOT NULL,
   used_at TIMESTAMPTZ,
