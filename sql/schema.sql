@@ -6,7 +6,8 @@ CREATE TABLE IF NOT EXISTS devices (
   device_name TEXT NOT NULL DEFAULT 'Android device',
   token_hash CHAR(64) NOT NULL UNIQUE,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  revoked_at TIMESTAMPTZ
+  revoked_at TIMESTAMPTZ,
+  last_seen_at TIMESTAMPTZ
 );
 
 CREATE TABLE IF NOT EXISTS pairing_codes (
@@ -32,3 +33,5 @@ CREATE TABLE IF NOT EXISTS parent_child_links (
   revoked_at TIMESTAMPTZ,
   UNIQUE(parent_device_id, child_device_id)
 );
+
+ALTER TABLE devices ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMPTZ;
