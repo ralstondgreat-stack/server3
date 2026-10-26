@@ -38,7 +38,7 @@ const makeCode = () => {
 app.get('/health', async (_req, res) => {
   try {
     await pool.query('SELECT 1');
-    res.json({ ok: true, service: 'kids-protection-api', version: '1.8.1', database: 'connected' });
+    res.json({ ok: true, service: 'kids-protection-api', version: '1.9.0', database: 'connected' });
   } catch (_e) {
     res.status(503).json({ ok: false, error: 'database_unavailable' });
   }
@@ -264,11 +264,28 @@ app.post('/v1/pairing/redeem', authenticate, requireRole('child'), async (req, r
   }
 });
 
+// Child heartbeat. Only authenticated child devices can update their own presence.
+app.post('/v1/heartbeat', authenticate, requireRole('child'), async (req, res) => {
+  try {
+    const result = await pool.query(
+      `UPDATE devices SET last_seen_at=NOW()
+       WHERE id=$1 AND role='child' AND revoked_at IS NULL
+       RETURNING last_seen_at`, [req.device.id]
+    );
+    if (!result.rowCount) return res.status(404).json({ error: 'child_device_not_found' });
+    res.json({ ok: true, deviceId: req.device.id, lastSeenAt: result.rows[0].last_seen_at });
+  } catch (e) {
+    console.error('heartbeat failed', e.message);
+    res.status(500).json({ error: 'internal_error' });
+  }
+});
+
 app.get('/v1/children', authenticate, requireRole('parent'), async (req, res) => {
   try {
     const result = await pool.query(
       `SELECT l.id AS pairing_id, l.paired_at, d.id AS child_device_id,
-              d.device_name, d.created_at AS registered_at
+              d.device_name, d.created_at AS registered_at, d.last_seen_at,
+              (d.last_seen_at IS NOT NULL AND d.last_seen_at >= NOW() - INTERVAL '90 seconds') AS online
        FROM parent_child_links l JOIN devices d ON d.id=l.child_device_id
        WHERE l.parent_device_id=$1 AND l.revoked_at IS NULL
        ORDER BY l.paired_at DESC`, [req.device.id]
@@ -316,9 +333,11 @@ async function ensureDatabaseSchema() {
       device_name TEXT NOT NULL DEFAULT 'Android device',
       token_hash CHAR(64) NOT NULL UNIQUE,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      revoked_at TIMESTAMPTZ
+      revoked_at TIMESTAMPTZ,
+      last_seen_at TIMESTAMPTZ
     )
   `);
+  await pool.query('ALTER TABLE devices ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMPTZ');
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS pairing_codes (
@@ -354,7 +373,7 @@ async function ensureDatabaseSchema() {
 
 async function startServer() {
   await ensureDatabaseSchema();
-  server = app.listen(port, '0.0.0.0', () => console.log(`Kids Protection API v1.8.1 listening on ${port}`));
+  server = app.listen(port, '0.0.0.0', () => console.log(`Kids Protection API v1.9.0 listening on ${port}`));
 }
 startServer().catch(async e => {
   console.error('Server startup/migration failed:', e.message);
